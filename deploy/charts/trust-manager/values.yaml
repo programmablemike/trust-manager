@@ -4,6 +4,10 @@ replicaCount: 1
 # -- For Private docker registries, authentication is needed. Registry secrets are applied to the service account
 imagePullSecrets: []
 
+global:
+  leaderElection:
+    namespace: kube-system
+
 image:
   # -- Target image repository.
   repository: quay.io/jetstack/trust-manager
