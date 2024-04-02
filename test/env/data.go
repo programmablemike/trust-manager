@@ -17,6 +17,7 @@ limitations under the License.
 package env
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -24,8 +25,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	jks "github.com/pavlo-v-chernykh/keystore-go/v4"
 	corev1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,7 +38,7 @@ import (
 )
 
 const (
-	EventuallyTimeout      = "30s"
+	EventuallyTimeout      = "90s"
 	EventuallyPollInterval = "100ms"
 )
 
@@ -76,7 +77,7 @@ func DefaultTrustData() TestData {
 
 // newTestBundle creates a new Bundle in the API using the input test data.
 // Returns the create Bundle object.
-func NewTestBundle(ctx context.Context, cl client.Client, opts bundle.Options, td TestData) *trustapi.Bundle {
+func newTestBundle(ctx context.Context, cl client.Client, opts bundle.Options, td TestData, targetType string) *trustapi.Bundle {
 	By("creating trust Bundle")
 
 	configMap := corev1.ConfigMap{
@@ -130,36 +131,59 @@ func NewTestBundle(ctx context.Context, cl client.Client, opts bundle.Options, t
 			},
 		},
 	}
+	if targetType == "ConfigMap" {
+		bundle.Spec.Target = trustapi.BundleTarget{
+			ConfigMap: &td.Target,
+		}
+	} else if targetType == "Secret" {
+		bundle.Spec.Target = trustapi.BundleTarget{
+			Secret: &td.Target,
+		}
+	}
 	Expect(cl.Create(ctx, &bundle)).NotTo(HaveOccurred())
 
 	return &bundle
+}
+
+// NewTestBundleSecretTarget creates a new Bundle in the API using the input test data.
+// Returns the create Bundle object.
+func NewTestBundleSecretTarget(ctx context.Context, cl client.Client, opts bundle.Options, td TestData) *trustapi.Bundle {
+	return newTestBundle(ctx, cl, opts, td, "Secret")
+}
+
+// newTestBundleConfigMapTarget creates a new Bundle in the API using the input test data with target set to ConfigMap.
+// Returns the create Bundle object.
+func NewTestBundleConfigMapTarget(ctx context.Context, cl client.Client, opts bundle.Options, td TestData) *trustapi.Bundle {
+	return newTestBundle(ctx, cl, opts, td, "ConfigMap")
 }
 
 func checkBundleSyncedInternal(ctx context.Context, cl client.Client, bundleName string, namespace string, comparator func(string) error) error {
 	var bundle trustapi.Bundle
 	Expect(cl.Get(ctx, client.ObjectKey{Name: bundleName}, &bundle)).NotTo(HaveOccurred())
 
-	var configMap corev1.ConfigMap
-	if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: bundle.Name}, &configMap); err != nil {
-		return fmt.Errorf("failed to get configMap %s/%s when checking bundle sync: %w", namespace, bundle.Name, err)
+	gotData := ""
+	if bundle.Spec.Target.ConfigMap != nil {
+		var configMap corev1.ConfigMap
+		if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: bundle.Name}, &configMap); err != nil {
+			return fmt.Errorf("failed to get configMap %s/%s when checking bundle sync: %w", namespace, bundle.Name, err)
+		}
+		gotData = configMap.Data[bundle.Spec.Target.ConfigMap.Key]
+	} else if bundle.Spec.Target.Secret != nil {
+		var secret corev1.Secret
+		if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: bundle.Name}, &secret); err != nil {
+			return fmt.Errorf("failed to get secret %s/%s when checking bundle sync: %w", namespace, bundle.Name, err)
+		}
+		gotData = string(secret.Data[bundle.Spec.Target.Secret.Key])
+	} else {
+		return fmt.Errorf("invalid bundle spec targets: %v", bundle.Spec.Target)
 	}
-
-	gotData := configMap.Data[bundle.Spec.Target.ConfigMap.Key]
 
 	if err := comparator(gotData); err != nil {
 		return fmt.Errorf("configMap %s/%s didn't have expected value: %w", namespace, bundle.Name, err)
 	}
 
-	if bundle.Status.Target == nil {
-		return fmt.Errorf("bundle status target was nil")
-	}
-
-	if !apiequality.Semantic.DeepEqual(*bundle.Status.Target, bundle.Spec.Target) {
-		return fmt.Errorf("bundle status target didn't match expected status target")
-	}
-
 	for _, condition := range bundle.Status.Conditions {
-		if condition.Status == corev1.ConditionTrue && bundle.Generation == condition.ObservedGeneration {
+		if condition.Status == metav1.ConditionTrue && bundle.Generation == condition.ObservedGeneration {
 			return nil
 		}
 	}
@@ -287,4 +311,33 @@ func EventuallyBundleHasSyncedAllNamespacesStartsWith(ctx context.Context, cl cl
 	).WithArguments(
 		ctx, cl, bundleName, startingData,
 	).Should(BeNil(), fmt.Sprintf("checking bundle %s has synced to all namespaces with correct starting data", bundleName))
+}
+
+// CheckJKSFileSynced ensures that the given JKS data
+func CheckJKSFileSynced(jksData []byte, expectedPassword string, expectedCertPEMData string) error {
+	reader := bytes.NewReader(jksData)
+
+	ks := jks.New()
+
+	err := ks.Load(reader, []byte(expectedPassword))
+	if err != nil {
+		return err
+	}
+
+	expectedCertList, err := util.ValidateAndSplitPEMBundle([]byte(expectedCertPEMData))
+	if err != nil {
+		return fmt.Errorf("invalid PEM data passed to CheckJKSFileSynced: %s", err)
+	}
+
+	// TODO: check that the cert content matches expectedCertPEMData exactly, not just
+	// that the count is the same
+
+	aliasCount := len(ks.Aliases())
+	expectedPEMCount := len(expectedCertList)
+
+	if aliasCount != expectedPEMCount {
+		return fmt.Errorf("expected %d certificates in JKS but found %d", expectedPEMCount, aliasCount)
+	}
+
+	return nil
 }

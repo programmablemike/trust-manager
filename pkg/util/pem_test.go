@@ -18,6 +18,7 @@ package util
 
 import (
 	"bytes"
+	"crypto/x509"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -34,9 +35,10 @@ func TestValidateAndSanitizePEMBundle(t *testing.T) {
 	}
 
 	cases := map[string]struct {
-		parts []string
-
-		expectErr bool
+		parts              []string
+		filterExpiredCerts bool
+		expectExpiredCerts bool
+		expectErr          bool
 	}{
 		"valid bundle with all types of cert and no comments succeeds": {
 			parts:     []string{dummy.TestCertificate1, dummy.TestCertificate2, dummy.TestCertificate3},
@@ -49,6 +51,11 @@ func TestValidateAndSanitizePEMBundle(t *testing.T) {
 		"valid bundle with all types of cert and a poison comment succeeds": {
 			parts:     []string{dummy.TestCertificate1, string(poisonComment), dummy.TestCertificate2, randomComment, dummy.TestCertificate3, string(poisonComment)},
 			expectErr: false,
+		},
+		"valid bundle with expired cert succeeds with the expired cert intact": {
+			parts:              []string{dummy.TestCertificate1, dummy.TestExpiredCertificate},
+			expectExpiredCerts: true,
+			expectErr:          false,
 		},
 		"invalid bundle with a certificate with a header fails": {
 			parts:     []string{dummy.TestCertificate1, dummyCertificateWithHeader, dummy.TestCertificate3},
@@ -66,13 +73,32 @@ func TestValidateAndSanitizePEMBundle(t *testing.T) {
 			parts:     []string{"abc123"},
 			expectErr: true,
 		},
+		"valid bundle with valid certs and filtered expired cert": {
+			parts:              []string{dummy.TestCertificate1, dummy.TestExpiredCertificate, dummy.TestCertificate3},
+			filterExpiredCerts: true,
+			expectExpiredCerts: false,
+			expectErr:          false,
+		},
+		"valid bundle with valid cert and multiple filtered expired certs": {
+			parts:              []string{dummy.TestCertificate1, dummy.TestExpiredCertificate, dummy.TestExpiredCertificate},
+			filterExpiredCerts: true,
+			expectExpiredCerts: false,
+			expectErr:          false,
+		},
+		"bundle with only a filtered expired cert is invalid": {
+			parts:              []string{dummy.TestExpiredCertificate},
+			filterExpiredCerts: true,
+			expectErr:          true,
+		},
 	}
 
 	for name, test := range cases {
 		t.Run(name, func(t *testing.T) {
+			validateOpts := ValidateAndSanitizeOptions{FilterExpired: test.filterExpiredCerts}
+
 			inputBundle := []byte(strings.Join(test.parts, "\n"))
 
-			sanitizedBundleBytes, err := ValidateAndSanitizePEMBundle(inputBundle)
+			sanitizedBundleBytes, err := ValidateAndSanitizePEMBundleWithOptions(inputBundle, validateOpts)
 
 			if test.expectErr != (err != nil) {
 				t.Fatalf("ValidateAndSanitizePEMBundle: expectErr: %v | err: %v", test.expectErr, err)
@@ -113,6 +139,38 @@ func TestValidateAndSanitizePEMBundle(t *testing.T) {
 				if !strings.HasSuffix(line, "-----") || strings.Count(line, "-----") != 2 {
 					t.Errorf("invalid encapsulation boundary on line of certificate")
 				}
+			}
+
+			certs, err := ValidateAndSplitPEMBundleWithOptions(sanitizedBundleBytes, validateOpts)
+			if err != nil {
+				t.Errorf("failed to split already-validated bundle: %s", err)
+				return
+			}
+
+			var expiredCerts []*x509.Certificate
+
+			for _, cert := range certs {
+				parsedCerts, err := DecodeX509CertificateChainBytes(cert)
+				if err != nil {
+					t.Errorf("failed to decode split PEM cert: %s", err)
+					continue
+				}
+
+				if len(parsedCerts) != 1 {
+					// shouldn't ever happen since we're decoding a single PEM cert
+					t.Errorf("got more than one parsed cert after splitting a PEM bundle")
+					continue
+				}
+
+				parsedCert := parsedCerts[0]
+
+				if parsedCert.NotAfter.Before(dummy.DummyInstant()) {
+					expiredCerts = append(expiredCerts, parsedCert)
+				}
+			}
+
+			if test.expectExpiredCerts != (len(expiredCerts) > 0) {
+				t.Errorf("expectExpiredCerts=%v but got %d expired certs", test.expectExpiredCerts, len(expiredCerts))
 			}
 		})
 	}

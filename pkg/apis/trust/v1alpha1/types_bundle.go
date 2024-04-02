@@ -17,11 +17,14 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+var BundleKind = "Bundle"
+
+var BundleLabelKey = "trust.cert-manager.io/bundle"
+var BundleHashAnnotationKey = "trust.cert-manager.io/hash"
+
 // +kubebuilder:object:root=true
 // +kubebuilder:printcolumn:name="Target",type="string",JSONPath=".status.target.configMap.key",description="Bundle Target Key"
 // +kubebuilder:printcolumn:name="Synced",type="string",JSONPath=`.status.conditions[?(@.type == "Synced")].status`,description="Bundle has been synced"
@@ -29,6 +32,8 @@ import (
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Timestamp Bundle was created"
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +genclient
+// +genclient:nonNamespaced
 
 type Bundle struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -42,8 +47,7 @@ type Bundle struct {
 	Status BundleStatus `json:"status"`
 }
 
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
+// +kubebuilder:object:root=true
 type BundleList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata"`
@@ -51,7 +55,7 @@ type BundleList struct {
 	Items []Bundle `json:"items"`
 }
 
-// BundleSepc defines the desired state of a Bundle.
+// BundleSpec defines the desired state of a Bundle.
 type BundleSpec struct {
 	// Sources is a set of references to data whose data will sync to the target.
 	Sources []BundleSource `json:"sources"`
@@ -63,13 +67,13 @@ type BundleSpec struct {
 // BundleSource is the set of sources whose data will be appended and synced to
 // the BundleTarget in all Namespaces.
 type BundleSource struct {
-	// ConfigMap is a reference to a ConfigMap's `data` key, in the trust
-	// Namespace.
+	// ConfigMap is a reference (by name) to a ConfigMap's `data` key, or to a
+	// list of ConfigMap's `data` key using label selector, in the trust Namespace.
 	// +optional
 	ConfigMap *SourceObjectKeySelector `json:"configMap,omitempty"`
 
-	// Secret is a reference to a Secrets's `data` key, in the trust
-	// Namespace.
+	// Secret is a reference (by name) to a Secret's `data` key, or to a
+	// list of Secret's `data` key using label selector, in the trust Namespace.
 	// +optional
 	Secret *SourceObjectKeySelector `json:"secret,omitempty"`
 
@@ -96,10 +100,51 @@ type BundleTarget struct {
 	// data will be synced to.
 	ConfigMap *KeySelector `json:"configMap,omitempty"`
 
+	// Secret is the target Secret that all Bundle source data will be synced to.
+	// Using Secrets as targets is only supported if enabled at trust-manager startup.
+	// By default, trust-manager has no permissions for writing to secrets and can only read secrets in the trust namespace.
+	Secret *KeySelector `json:"secret,omitempty"`
+
+	// AdditionalFormats specifies any additional formats to write to the target
+	// +optional
+	AdditionalFormats *AdditionalFormats `json:"additionalFormats,omitempty"`
+
 	// NamespaceSelector will, if set, only sync the target resource in
 	// Namespaces which match the selector.
 	// +optional
 	NamespaceSelector *NamespaceSelector `json:"namespaceSelector,omitempty"`
+}
+
+// AdditionalFormats specifies any additional formats to write to the target
+type AdditionalFormats struct {
+	// JKS requests a JKS-formatted binary trust bundle to be written to the target.
+	// The bundle has "changeit" as the default password.
+	// For more information refer to this link https://cert-manager.io/docs/faq/#keystore-passwords
+	JKS *JKS `json:"jks,omitempty"`
+	// PKCS12 requests a PKCS12-formatted binary trust bundle to be written to the target.
+	// The bundle is by default created without a password.
+	PKCS12 *PKCS12 `json:"pkcs12,omitempty"`
+}
+
+type JKS struct {
+	KeySelector `json:",inline"`
+
+	// Password for JKS trust store
+	//+optional
+	//+kubebuilder:validation:MinLength=1
+	//+kubebuilder:validation:MaxLength=128
+	//+kubebuilder:default=changeit
+	Password *string `json:"password"`
+}
+
+type PKCS12 struct {
+	KeySelector `json:",inline"`
+
+	// Password for PKCS12 trust store
+	//+optional
+	//+kubebuilder:validation:MaxLength=128
+	//+kubebuilder:default=""
+	Password *string `json:"password,omitempty"`
 }
 
 // NamespaceSelector defines selectors to match on Namespaces.
@@ -114,10 +159,16 @@ type NamespaceSelector struct {
 // in the trust Namespace.
 type SourceObjectKeySelector struct {
 	// Name is the name of the source object in the trust Namespace.
-	Name string `json:"name"`
+	// This field must be left empty when `selector` is set
+	//+optional
+	Name string `json:"name,omitempty"`
 
-	// KeySelector is the key of the entry in the objects' `data` field to be
-	// referenced.
+	// Selector is the label selector to use to fetch a list of objects. Must not be set
+	// when `Name` is set.
+	//+optional
+	Selector *metav1.LabelSelector `json:"selector,omitempty"`
+
+	// KeySelector is the key of the entry in the objects' `data` field to be referenced.
 	KeySelector `json:",inline"`
 }
 
@@ -129,13 +180,10 @@ type KeySelector struct {
 
 // BundleStatus defines the observed state of the Bundle.
 type BundleStatus struct {
-	// Target is the current Target that the Bundle is attempting or has
-	// completed syncing the source data to.
-	// +optional
-	Target *BundleTarget `json:"target"`
-
 	// List of status conditions to indicate the status of the Bundle.
 	// Known condition types are `Bundle`.
+	// +listType=map
+	// +listMapKey=type
 	// +optional
 	Conditions []BundleCondition `json:"conditions,omitempty"`
 
@@ -143,30 +191,40 @@ type BundleStatus struct {
 	// which was retrieved when the set of default CAs was requested in the bundle
 	// source. This should only be set if useDefaultCAs was set to "true" on a source,
 	// and will be the same for the same version of a bundle with identical certificates.
+	// +optional
 	DefaultCAPackageVersion *string `json:"defaultCAVersion,omitempty"`
 }
 
 // BundleCondition contains condition information for a Bundle.
 type BundleCondition struct {
 	// Type of the condition, known values are (`Synced`).
-	Type BundleConditionType `json:"type"`
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$`
+	// +kubebuilder:validation:MaxLength=316
+	Type string `json:"type"`
 
-	// Status of the condition, one of ('True', 'False', 'Unknown').
-	Status corev1.ConditionStatus `json:"status"`
+	// Status of the condition, one of True, False, Unknown.
+	// +kubebuilder:validation:Enum=True;False;Unknown
+	Status metav1.ConditionStatus `json:"status"`
 
 	// LastTransitionTime is the timestamp corresponding to the last status
 	// change of this condition.
-	// +optional
-	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Format=date-time
+	LastTransitionTime metav1.Time `json:"lastTransitionTime"`
 
-	// Reason is a brief machine readable explanation for the condition's last
+	// Reason is a brief machine-readable explanation for the condition's last
 	// transition.
-	// +optional
-	Reason string `json:"reason,omitempty"`
+	// The value should be a CamelCase string.
+	// This field may not be empty.
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$`
+	Reason string `json:"reason"`
 
-	// Message is a human readable description of the details of the last
+	// Message is a human-readable description of the details of the last
 	// transition, complementing reason.
 	// +optional
+	// +kubebuilder:validation:MaxLength=32768
 	Message string `json:"message,omitempty"`
 
 	// If set, this represents the .metadata.generation that the condition was
@@ -175,14 +233,12 @@ type BundleCondition struct {
 	// .status.condition[x].observedGeneration is 9, the condition is out of date
 	// with respect to the current state of the Bundle.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
-
-// BundleConditionType represents a Bundle condition value.
-type BundleConditionType string
 
 const (
 	// BundleConditionSynced indicates that the Bundle has successfully synced
 	// all source bundle data to the Bundle target in all Namespaces.
-	BundleConditionSynced BundleConditionType = "Synced"
+	BundleConditionSynced string = "Synced"
 )

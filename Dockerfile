@@ -13,9 +13,10 @@
 # limitations under the License.
 
 # Build the trust binary
-FROM docker.io/library/golang:1.19 as builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.22 as builder
 
 ARG GOPROXY
+ARG TARGETARCH
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -29,17 +30,21 @@ COPY make/ make/
 # Copy the go source files
 COPY cmd/ cmd/
 COPY pkg/ pkg/
+COPY hack/ hack/
 
 RUN GOPROXY=$GOPROXY go mod download
 
 # Build
-RUN make build
+RUN make build-linux-$TARGETARCH
 
 FROM scratch
-LABEL description="cert-manager trust is an operator for distributing trust bundles across a Kubernetes cluster"
+
+ARG TARGETARCH
+
+LABEL description="trust-manager is an operator for distributing trust bundles across a Kubernetes cluster"
 
 WORKDIR /
 USER 1001
-COPY --from=builder /workspace/bin/trust-manager /usr/bin/trust-manager
+COPY --from=builder /workspace/bin/trust-manager-linux-$TARGETARCH /usr/bin/trust-manager
 
 ENTRYPOINT ["/usr/bin/trust-manager"]

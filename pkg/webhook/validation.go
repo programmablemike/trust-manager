@@ -18,18 +18,16 @@ package webhook
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"sync"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	"github.com/cert-manager/trust-manager/pkg/apis/trust"
 	trustapi "github.com/cert-manager/trust-manager/pkg/apis/trust/v1alpha1"
 )
 
@@ -37,123 +35,130 @@ import (
 type validator struct {
 	log logr.Logger
 
-	decoder *admission.Decoder
-
 	lock sync.RWMutex
 }
 
-// Handle is a Kubernetes validation webhook server handler. Returns an
-// admission response containing whether the request is allowed or not.
-func (v *validator) Handle(ctx context.Context, req admission.Request) admission.Response {
-	log := v.log.WithValues("name", req.Name)
-	log.V(2).Info("received validation request")
+var _ admission.CustomValidator = &validator{}
 
-	if req.RequestKind == nil {
-		return admission.Errored(http.StatusBadRequest, errors.New("no resource kind sent in request"))
+func (v *validator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	return v.validate(ctx, obj)
+}
+
+func (v *validator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	oldBundle, ok := oldObj.(*trustapi.Bundle)
+	if !ok {
+		return nil, fmt.Errorf("expected a Bundle, but got a %T", oldBundle)
+	}
+	newBundle, ok := newObj.(*trustapi.Bundle)
+	if !ok {
+		return nil, fmt.Errorf("expected a Bundle, but got a %T", newBundle)
 	}
 
 	var (
-		el  field.ErrorList
-		err error
+		el   field.ErrorList
+		path = field.NewPath("spec")
 	)
-
-	switch *req.RequestKind {
-	case metav1.GroupVersionKind{Group: trust.GroupName, Version: "v1alpha1", Kind: "Bundle"}:
-		var bundle trustapi.Bundle
-
-		v.lock.RLock()
-		err := v.decoder.Decode(req, &bundle)
-		v.lock.RUnlock()
-
-		if err != nil {
-			log.Error(err, "failed to decode Bundle")
-			return admission.Errored(http.StatusBadRequest, err)
-		}
-
-		el, err = v.validateBundle(ctx, &bundle)
-
-	default:
-		return admission.Denied(fmt.Sprintf("validation request for unrecognised resource type: %s/%s %s", req.RequestKind.Group, req.RequestKind.Version, req.RequestKind.Kind))
+	// Target removal are not allowed.
+	if oldBundle.Spec.Target.ConfigMap != nil && newBundle.Spec.Target.ConfigMap == nil {
+		el = append(el, field.Invalid(path.Child("target", "configmap"), "", "target configMap removal is not allowed"))
+		return nil, el.ToAggregate()
 	}
-
-	if err != nil {
-		log.Error(err, "internal error occurred validating request")
-		return admission.Errored(http.StatusInternalServerError, err)
+	// Target removal are not allowed.
+	if oldBundle.Spec.Target.Secret != nil && newBundle.Spec.Target.Secret == nil {
+		el = append(el, field.Invalid(path.Child("target", "secret"), "", "target secret removal is not allowed"))
+		return nil, el.ToAggregate()
 	}
-
-	if err := el.ToAggregate(); err != nil {
-		v.log.V(2).Info("denied request", "reason", el.ToAggregate().Error())
-		return admission.Denied(el.ToAggregate().Error())
-	}
-
-	log.V(2).Info("allowed request")
-	return admission.Allowed("Bundle validated")
+	return v.validate(ctx, newObj)
 }
 
-// validateBundle validates the incoming Bundle object and returns any
-// resulting error.
-func (v *validator) validateBundle(ctx context.Context, bundle *trustapi.Bundle) (field.ErrorList, error) {
-	var el field.ErrorList
-	path := field.NewPath("spec")
+func (v *validator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	// always allow deletes
+	return nil, nil
+}
 
-	if len(bundle.Spec.Sources) == 0 {
-		el = append(el, field.Forbidden(path.Child("sources"), "must define at least one source"))
-	} else {
-		path := path.Child("sources")
+func (v *validator) validate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	bundle, ok := obj.(*trustapi.Bundle)
+	if !ok {
+		return nil, fmt.Errorf("expected a Bundle, but got a %T", obj)
+	}
+	log := v.log.WithValues("name", bundle.Name)
+	log.V(2).Info("received validation request")
+	var (
+		el       field.ErrorList
+		warnings admission.Warnings
+		path     = field.NewPath("spec")
+	)
 
-		defaultCAsCount := 0
+	sourceCount := 0
+	defaultCAsCount := 0
 
-		for i, source := range bundle.Spec.Sources {
-			path := path.Child("[" + strconv.Itoa(i) + "]")
+	for i, source := range bundle.Spec.Sources {
+		path := path.Child("sources").Child("[" + strconv.Itoa(i) + "]")
 
-			unionCount := 0
+		unionCount := 0
 
-			if configMap := source.ConfigMap; configMap != nil {
-				path := path.Child("configMap")
-				unionCount++
+		if configMap := source.ConfigMap; configMap != nil {
+			path := path.Child("configMap")
+			sourceCount++
+			unionCount++
 
-				if len(configMap.Name) == 0 {
-					el = append(el, field.Invalid(path.Child("name"), configMap.Name, "source configMap name must be defined"))
-				}
-				if len(configMap.Key) == 0 {
-					el = append(el, field.Invalid(path.Child("key"), configMap.Key, "source configMap key must be defined"))
-				}
+			if len(configMap.Name) == 0 && configMap.Selector == nil {
+				el = append(el, field.Invalid(path, "name: ' ', selector: nil", "must validate one and only one schema (oneOf): [name, selector]. Found none valid"))
 			}
-
-			if secret := source.Secret; secret != nil {
-				path := path.Child("secret")
-				unionCount++
-
-				if len(secret.Name) == 0 {
-					el = append(el, field.Invalid(path.Child("name"), secret.Name, "source secret name must be defined"))
-				}
-				if len(secret.Key) == 0 {
-					el = append(el, field.Invalid(path.Child("key"), secret.Key, "source secret key must be defined"))
-				}
+			if len(configMap.Name) > 0 && configMap.Selector != nil {
+				el = append(el, field.Invalid(path, fmt.Sprintf("name: %s, selector: {}", configMap.Name), "must validate one and only one schema (oneOf): [name, selector]. Found both set"))
 			}
-
-			if source.InLine != nil {
-				unionCount++
-			}
-
-			if source.UseDefaultCAs != nil && *source.UseDefaultCAs {
-				unionCount++
-				defaultCAsCount++
-			}
-
-			if unionCount != 1 {
-				el = append(el, field.Forbidden(
-					path, fmt.Sprintf("must define exactly one source type for each item but found %d defined types", unionCount),
-				))
+			if len(configMap.Key) == 0 {
+				el = append(el, field.Invalid(path.Child("key"), configMap.Key, "source configMap key must be defined"))
 			}
 		}
 
-		if defaultCAsCount > 1 {
+		if secret := source.Secret; secret != nil {
+			path := path.Child("secret")
+			sourceCount++
+			unionCount++
+
+			if len(secret.Name) == 0 && secret.Selector == nil {
+				el = append(el, field.Invalid(path, "name: ' ', selector: nil", "must validate one and only one schema (oneOf): [name, selector]. Found none valid"))
+			}
+			if len(secret.Name) > 0 && secret.Selector != nil {
+				el = append(el, field.Invalid(path, fmt.Sprintf("name: %s, selector: {}", secret.Name), "must validate one and only one schema (oneOf): [name, selector]. Found both set"))
+			}
+			if len(secret.Key) == 0 {
+				el = append(el, field.Invalid(path.Child("key"), secret.Key, "source secret key must be defined"))
+			}
+		}
+
+		if source.InLine != nil {
+			sourceCount++
+			unionCount++
+		}
+
+		if source.UseDefaultCAs != nil {
+			defaultCAsCount++
+			unionCount++
+
+			if *source.UseDefaultCAs {
+				sourceCount++
+			}
+		}
+
+		if unionCount != 1 {
 			el = append(el, field.Forbidden(
-				path,
-				fmt.Sprintf("must request default CAs either once or not at all but got %d requests", defaultCAsCount),
+				path, fmt.Sprintf("must define exactly one source type for each item but found %d defined types", unionCount),
 			))
 		}
+	}
+
+	if sourceCount == 0 {
+		el = append(el, field.Forbidden(path.Child("sources"), "must define at least one source"))
+	}
+
+	if defaultCAsCount > 1 {
+		el = append(el, field.Forbidden(
+			path.Child("sources"),
+			fmt.Sprintf("must request default CAs either once or not at all but got %d requests", defaultCAsCount),
+		))
 	}
 
 	if target := bundle.Spec.Target.ConfigMap; target != nil {
@@ -165,10 +170,58 @@ func (v *validator) validateBundle(ctx context.Context, bundle *trustapi.Bundle)
 		}
 	}
 
-	if configMap := bundle.Spec.Target.ConfigMap; configMap == nil {
-		el = append(el, field.Invalid(path.Child("target", "configMap"), configMap, "target configMap must be defined"))
-	} else if len(configMap.Key) == 0 {
+	if target := bundle.Spec.Target.Secret; target != nil {
+		path := path.Child("sources")
+		for i, source := range bundle.Spec.Sources {
+			if source.Secret != nil && source.Secret.Name == bundle.Name && source.Secret.Key == target.Key {
+				el = append(el, field.Forbidden(path.Child(fmt.Sprintf("[%d]", i), "secret", source.Secret.Name, source.Secret.Key), "cannot define the same source as target"))
+			}
+		}
+	}
+
+	configMap := bundle.Spec.Target.ConfigMap
+	secret := bundle.Spec.Target.Secret
+
+	if configMap == nil && secret == nil {
+		el = append(el, field.Invalid(path.Child("target"), bundle.Spec.Target, "must define at least one target"))
+	}
+
+	if configMap != nil && len(configMap.Key) == 0 {
 		el = append(el, field.Invalid(path.Child("target", "configMap", "key"), configMap.Key, "target configMap key must be defined"))
+	}
+
+	if secret != nil && len(secret.Key) == 0 {
+		el = append(el, field.Invalid(path.Child("target", "secret", "key"), secret.Key, "target secret key must be defined"))
+	}
+
+	if bundle.Spec.Target.AdditionalFormats != nil {
+		var formats = make(map[string]*trustapi.KeySelector)
+		targetKeys := map[string]struct{}{}
+		if configMap != nil {
+			targetKeys[configMap.Key] = struct{}{}
+		}
+		if secret != nil {
+			targetKeys[secret.Key] = struct{}{}
+		}
+
+		// Checks for nil to avoid nil point dereference error
+		if bundle.Spec.Target.AdditionalFormats.JKS != nil {
+			formats["jks"] = &bundle.Spec.Target.AdditionalFormats.JKS.KeySelector
+		}
+
+		// Checks for nil to avoid nil point dereference error
+		if bundle.Spec.Target.AdditionalFormats.PKCS12 != nil {
+			formats["pkcs12"] = &bundle.Spec.Target.AdditionalFormats.PKCS12.KeySelector
+		}
+
+		for f, selector := range formats {
+			if selector != nil {
+				if _, ok := targetKeys[selector.Key]; ok {
+					el = append(el, field.Invalid(path.Child("target", "additionalFormats", f, "key"), selector.Key, "key must be unique in target configMap"))
+				}
+				targetKeys[selector.Key] = struct{}{}
+			}
+		}
 	}
 
 	if nsSel := bundle.Spec.Target.NamespaceSelector; nsSel != nil && len(nsSel.MatchLabels) > 0 {
@@ -177,38 +230,6 @@ func (v *validator) validateBundle(ctx context.Context, bundle *trustapi.Bundle)
 		}
 	}
 
-	path = field.NewPath("status")
+	return warnings, el.ToAggregate()
 
-	conditionTypes := make(map[trustapi.BundleConditionType]struct{})
-	for i, condition := range bundle.Status.Conditions {
-		if _, ok := conditionTypes[condition.Type]; ok {
-			el = append(el, field.Invalid(path.Child("conditions", "["+strconv.Itoa(i)+"]"), condition, "condition type already present on Bundle"))
-		}
-		conditionTypes[condition.Type] = struct{}{}
-	}
-
-	return el, nil
-}
-
-// InjectDecoder is used by the controller-runtime manager to inject an object
-// decoder to convert into know trust.cert-manager.io types.
-func (v *validator) InjectDecoder(d *admission.Decoder) error {
-	v.lock.Lock()
-	defer v.lock.Unlock()
-
-	v.decoder = d
-	return nil
-}
-
-// check is used by the shared readiness manager to expose whether the server
-// is ready.
-func (v *validator) check(_ *http.Request) error {
-	v.lock.RLock()
-	defer v.lock.RUnlock()
-
-	if v.decoder != nil {
-		return nil
-	}
-
-	return errors.New("not ready")
 }

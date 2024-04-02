@@ -42,35 +42,32 @@ import (
 // contain (accidental) private information. They're also non-standard according to
 // https://www.rfc-editor.org/rfc/rfc7468
 
-// See also https://github.com/golang/go/blob/5d5ed57b134b7a02259ff070864f753c9e601a18/src/crypto/x509/cert_pool.go#L201-L239
+type ValidateAndSanitizeOptions struct {
+	FilterExpired bool // If true, expired certificates will be filtered out
+}
+
+// ValidateAndSanitizePEMBundle keeps the original function signature for backward compatibility
 func ValidateAndSanitizePEMBundle(data []byte) ([]byte, error) {
-	var certificates [][]byte
+	opts := ValidateAndSanitizeOptions{
+		FilterExpired: false,
+	}
+	return ValidateAndSanitizePEMBundleWithOptions(data, opts)
+}
 
-	for {
-		var b *pem.Block
-		b, data = pem.Decode(data)
+// ValidateAndSplitPEMBundle keeps the original function signature for backward compatibility
+func ValidateAndSplitPEMBundle(data []byte) ([][]byte, error) {
+	opts := ValidateAndSanitizeOptions{
+		FilterExpired: false,
+	}
+	return ValidateAndSplitPEMBundleWithOptions(data, opts)
+}
 
-		if b == nil {
-			break
-		}
-
-		if b.Type != "CERTIFICATE" {
-			// only certificates are allowed in a bundle
-			return nil, fmt.Errorf("invalid PEM block in bundle: only CERTIFICATE blocks are permitted but found '%s'", b.Type)
-		}
-
-		if len(b.Headers) != 0 {
-			return nil, fmt.Errorf("invalid PEM block in bundle; blocks are not permitted to have PEM headers")
-		}
-
-		_, err := x509.ParseCertificate(b.Bytes)
-		if err != nil {
-			// the presence of an invalid cert (including things which aren't certs)
-			// should cause the bundle to be rejected
-			return nil, fmt.Errorf("invalid PEM block in bundle; invalid PEM certificate: %w", err)
-		}
-
-		certificates = append(certificates, pem.EncodeToMemory(b))
+// See also https://github.com/golang/go/blob/5d5ed57b134b7a02259ff070864f753c9e601a18/src/crypto/x509/cert_pool.go#L201-L239
+// An option to enable filtering of expired certificates is available.
+func ValidateAndSanitizePEMBundleWithOptions(data []byte, opts ValidateAndSanitizeOptions) ([]byte, error) {
+	certificates, err := ValidateAndSplitPEMBundleWithOptions(data, opts)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(certificates) == 0 {
@@ -78,4 +75,49 @@ func ValidateAndSanitizePEMBundle(data []byte) ([]byte, error) {
 	}
 
 	return bytes.TrimSpace(bytes.Join(certificates, nil)), nil
+}
+
+// ValidateAndSplitPEMBundleWithOptions takes a PEM bundle as input, validates it and
+// returns the list of certificates as a slice, allowing them to be iterated over.
+// This process involves performs deduplication of certificates to ensure
+// no duplicated certificates in the bundle.
+// For details of the validation performed, see the comment for ValidateAndSanitizePEMBundle
+// An option to enable filtering of expired certificates is available.
+func ValidateAndSplitPEMBundleWithOptions(data []byte, opts ValidateAndSanitizeOptions) ([][]byte, error) {
+	var certPool *certPool = newCertPool(opts.FilterExpired) // put PEM encoded certificate into a pool
+
+	err := certPool.appendCertFromPEM(data)
+	if err != nil {
+		return nil, fmt.Errorf("invalid PEM block in bundle; invalid PEM certificate: %w", err)
+	}
+
+	return certPool.getCertsPEM(), nil
+}
+
+// DecodeX509CertificateChainBytes will decode a PEM encoded x509 Certificate chain.
+func DecodeX509CertificateChainBytes(certBytes []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+
+	var block *pem.Block
+
+	for {
+		// decode the tls certificate pem
+		block, certBytes = pem.Decode(certBytes)
+		if block == nil {
+			break
+		}
+
+		// parse the tls certificate
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing TLS certificate: %s", err.Error())
+		}
+		certs = append(certs, cert)
+	}
+
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("error decoding certificate PEM block")
+	}
+
+	return certs, nil
 }

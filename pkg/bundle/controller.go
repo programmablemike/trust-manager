@@ -22,8 +22,9 @@ import (
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -43,53 +45,28 @@ import (
 // The Bundle controller will reconcile Bundles on Bundle events, as well as
 // when any related resource event in the Bundle source and target.
 // The controller will only cache metadata for ConfigMaps and Secrets.
-func AddBundleController(ctx context.Context, mgr manager.Manager, opts Options) error {
-	targetDirectClient, err := client.New(mgr.GetConfig(), client.Options{
-		Scheme: mgr.GetScheme(),
-		Mapper: mgr.GetRESTMapper(),
+func AddBundleController(
+	ctx context.Context,
+	mgr manager.Manager,
+	opts Options,
+	targetCache cache.Cache,
+) error {
+	directClient, err := client.New(mgr.GetConfig(), client.Options{
+		HTTPClient: mgr.GetHTTPClient(),
+		Scheme:     mgr.GetScheme(),
+		Mapper:     mgr.GetRESTMapper(),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create client: %w", err)
-	}
-
-	sourceCache, err := cache.New(mgr.GetConfig(), cache.Options{
-		Scheme:    mgr.GetScheme(),
-		Mapper:    mgr.GetRESTMapper(),
-		Namespace: opts.Namespace,
-
-		// These transforms are used as a safety check to ensure that only
-		// resources of the expected types are cached.
-		TransformByObject: map[client.Object]toolscache.TransformFunc{
-			new(corev1.Namespace): func(obj any) (any, error) {
-				return obj, nil
-			},
-			new(trustapi.Bundle): func(obj any) (any, error) {
-				return obj, nil
-			},
-			new(corev1.Secret): func(obj any) (any, error) {
-				return obj, nil
-			},
-			new(corev1.ConfigMap): func(obj any) (any, error) {
-				return obj, nil
-			},
-		},
-		DefaultTransform: func(obj any) (any, error) {
-			return nil, fmt.Errorf("object %T not supported by target cache", obj)
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create source cache: %w", err)
-	}
-	if err := mgr.Add(sourceCache); err != nil {
-		return fmt.Errorf("failed to add source cache to manager: %w", err)
+		return fmt.Errorf("failed to create direct client: %w", err)
 	}
 
 	b := &bundle{
-		targetDirectClient: targetDirectClient,
-		sourceLister:       sourceCache,
-		recorder:           mgr.GetEventRecorderFor("bundles"),
-		clock:              clock.RealClock{},
-		Options:            opts,
+		client:       mgr.GetClient(),
+		directClient: directClient,
+		targetCache:  targetCache,
+		recorder:     mgr.GetEventRecorderFor("bundles"),
+		clock:        clock.RealClock{},
+		Options:      opts,
 	}
 
 	if b.Options.DefaultPackageLocation != "" {
@@ -104,117 +81,154 @@ func AddBundleController(ctx context.Context, mgr manager.Manager, opts Options)
 	}
 
 	// Only reconcile config maps that match the well known name
-	if err := ctrl.NewControllerManagedBy(mgr).
+	controller := ctrl.NewControllerManagedBy(mgr).
 		Named("bundles").
 
 		////// Targets //////
 
-		// Reconcile over owned ConfigMaps in all Namespaces. Only cache metadata.
-		// These ConfigMaps will be Bundle Targets
-		Watches(&source.Kind{Type: new(corev1.ConfigMap)}, &handler.EnqueueRequestForOwner{
-			OwnerType:    new(trustapi.Bundle),
-			IsController: true,
-		}, builder.OnlyMetadata).
+		// Reconcile a Bundle on events against a ConfigMap that it
+		// owns. Only cache ConfigMap metadata.
+		WatchesRawSource(
+			source.Kind(targetCache, &corev1.ConfigMap{}),
+			handler.EnqueueRequestForOwner(
+				mgr.GetScheme(),
+				mgr.GetRESTMapper(),
+				&trustapi.Bundle{},
+				handler.OnlyControllerOwner(),
+			),
+			builder.OnlyMetadata,
+		)
 
-		////// Sources //////
+	if opts.SecretTargetsEnabled {
+		// Reconcile a Bundle on events against a Secret that it
+		// owns. Only cache Secret metadata.
+		controller.WatchesRawSource(
+			source.Kind(targetCache, &corev1.Secret{}),
+			handler.EnqueueRequestForOwner(
+				mgr.GetScheme(),
+				mgr.GetRESTMapper(),
+				&trustapi.Bundle{},
+				handler.OnlyControllerOwner(),
+			),
+			builder.OnlyMetadata,
+		)
+	}
 
-		// Reconcile trust.cert-manager.io Bundles
-		Watches(source.NewKindWithCache(new(trustapi.Bundle), sourceCache), &handler.EnqueueRequestForObject{}).
+	////// Sources //////
+
+	// Reconcile trust.cert-manager.io Bundles
+	controller.Watches(&trustapi.Bundle{}, &handler.EnqueueRequestForObject{}).
 
 		// Watch all Namespaces. Cache whole Namespaces to include Phase Status.
 		// Reconcile all Bundles on a Namespace change.
-		Watches(source.NewKindWithCache(new(corev1.Namespace), sourceCache), handler.EnqueueRequestsFromMapFunc(
-			func(obj client.Object) []reconcile.Request {
-				// If an error happens here and we do nothing, we run the risk of
-				// leaving a Namespace behind when syncing.
-				// Exiting error is the safest option, as it will force a resync on
-				// all Bundles on start.
-				bundleList := b.mustBundleList(ctx)
-
-				var requests []reconcile.Request
-				for _, bundle := range bundleList.Items {
-					requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: bundle.Name}})
+		Watches(&corev1.Namespace{}, b.enqueueRequestsFromBundleFunc(
+			func(obj client.Object, bundle trustapi.Bundle) bool {
+				namespaceSelector, err := b.bundleTargetNamespaceSelector(&bundle)
+				if err != nil {
+					// We have an invalid selector, so we can skip this Bundle.
+					return false
 				}
 
-				return requests
-			},
-		)).
+				return namespaceSelector.Matches(labels.Set(obj.GetLabels()))
+			})).
 
-		// Watch ConfigMaps in trust Namespace. Only cache metadata.
+		// Watch ConfigMaps in trust Namespace.
 		// Reconcile Bundles who reference a modified source ConfigMap.
-		Watches(source.NewKindWithCache(new(corev1.ConfigMap), sourceCache), handler.EnqueueRequestsFromMapFunc(
-			func(obj client.Object) []reconcile.Request {
-				// If an error happens here and we do nothing, we run the risk of
-				// having trust Bundles out of sync with this source or target
-				// ConfigMap.
-				// Exiting error is the safest option, as it will force a resync on
-				// all Bundles on start.
-				bundleList := b.mustBundleList(ctx)
+		Watches(&corev1.ConfigMap{}, b.enqueueRequestsFromBundleFunc(
+			func(obj client.Object, bundle trustapi.Bundle) bool {
+				for _, source := range bundle.Spec.Sources {
+					if source.ConfigMap == nil {
+						continue
+					}
 
-				var requests []reconcile.Request
-				for _, bundle := range bundleList.Items {
-					for _, source := range bundle.Spec.Sources {
-						if source.ConfigMap == nil {
-							continue
-						}
-
-						// Bundle references this ConfigMap as a source. Add to request.
-						if source.ConfigMap.Name == obj.GetName() {
-							requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: bundle.Name}})
-							break
-						}
+					if source.ConfigMap.Selector != nil && labelsMatchSelector(obj.GetLabels(), source.ConfigMap.Selector) {
+						return true
+					} else if source.ConfigMap.Name == obj.GetName() {
+						return true
 					}
 				}
+				return false
+			}), builder.WithPredicates(inNamespacePredicate(b.Options.Namespace))).
 
-				return requests
-			},
-		)).
-
-		// Watch Secrets in trust Namespace. Only cache metadata.
+		// Watch Secrets in trust Namespace.
 		// Reconcile Bundles who reference a modified source Secret.
-		Watches(source.NewKindWithCache(new(corev1.Secret), sourceCache), handler.EnqueueRequestsFromMapFunc(
-			func(obj client.Object) []reconcile.Request {
-				// If an error happens here and we do nothing, we run the risk of
-				// having trust Bundles out of sync with this source Secret.
-				// Exiting error is the safest option, as it will force a resync on
-				// all Bundles on start.
-				bundleList := b.mustBundleList(ctx)
+		Watches(&corev1.Secret{}, b.enqueueRequestsFromBundleFunc(
+			func(obj client.Object, bundle trustapi.Bundle) bool {
+				for _, source := range bundle.Spec.Sources {
+					if source.Secret == nil {
+						continue
+					}
 
-				var requests []reconcile.Request
-				for _, bundle := range bundleList.Items {
-					for _, source := range bundle.Spec.Sources {
-						if source.Secret == nil {
-							continue
-						}
-
-						// Bundle references this Secret as a source. Add to request.
-						if source.Secret.Name == obj.GetName() {
-							requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: bundle.Name}})
-							break
+					if source.Secret.Selector != nil {
+						if labelsMatchSelector(obj.GetLabels(), source.Secret.Selector) {
+							return true
 						}
 					}
+
+					if source.Secret.Name == obj.GetName() {
+						return true
+					}
 				}
+				return false
+			}), builder.WithPredicates(inNamespacePredicate(b.Options.Namespace)))
 
-				return requests
-			},
-		)).
-
-		// Complete controller.
-		Complete(b); err != nil {
+	// Complete controller.
+	if err := controller.Complete(b); err != nil {
 		return fmt.Errorf("failed to create Bundle controller: %s", err)
 	}
 
 	return nil
 }
 
+// enqueueRequestsFromBundleFunc returns an event handler for watching Bundle dependants.
+// It will invoke the provided function for all Bundles and trigger a Bundle reconcile if the
+// functions returns true.
+func (b *bundle) enqueueRequestsFromBundleFunc(fn func(obj client.Object, bundle trustapi.Bundle) bool) handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, obj client.Object) []reconcile.Request {
+			// If an error happens here, and we do nothing, we run the risk of
+			// having trust Bundles out of sync with resource dependants.
+			// Exiting error is the safest option, as it will force a re-sync on
+			// all Bundles on start.
+			bundleList := b.mustBundleList(ctx)
+
+			var requests []reconcile.Request
+			for _, bundle := range bundleList.Items {
+				if fn(obj, bundle) {
+					requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: bundle.Name}})
+				}
+			}
+
+			return requests
+		},
+	)
+}
+
 // mustBundleList will return a BundleList of all Bundles in the cluster. If an
 // error occurs, will exit error the program.
 func (b *bundle) mustBundleList(ctx context.Context) *trustapi.BundleList {
 	var bundleList trustapi.BundleList
-	if err := b.sourceLister.List(ctx, &bundleList); err != nil {
+	if err := b.client.List(ctx, &bundleList); err != nil {
 		b.Log.Error(err, "failed to list all Bundles, exiting error")
 		os.Exit(-1)
 	}
 
 	return &bundleList
+}
+
+// inNamespacePredicate creates an event filter predicate for resources in namespace.
+func inNamespacePredicate(namespace string) predicate.Predicate {
+	return predicate.NewPredicateFuncs(func(object client.Object) bool {
+		return object.GetNamespace() == namespace
+	})
+}
+
+// labelsMatchSelector returns true if objLabels matches the label selector
+// and false otherwise
+func labelsMatchSelector(objLabels map[string]string, labelSelector *metav1.LabelSelector) bool {
+	selector, err := metav1.LabelSelectorAsSelector(labelSelector)
+	if err != nil {
+		return false
+	}
+	return selector.Matches(labels.Set(objLabels))
 }

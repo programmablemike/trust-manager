@@ -19,8 +19,8 @@ package test
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/utils/ptr"
 
-	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -35,7 +35,7 @@ var (
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 	env = &envtest.Environment{
-		UseExistingCluster: pointer.Bool(false),
+		UseExistingCluster: ptr.To(false),
 		CRDDirectoryPaths: []string{
 			"../../../deploy/crds/trust.cert-manager.io_bundles.yaml",
 		},
@@ -44,8 +44,13 @@ var _ = BeforeSuite(func() {
 
 	_, err := env.Start()
 	Expect(err).NotTo(HaveOccurred())
+	if err != nil {
+		env = nil // prevent AfterSuite from trying to stop it
+	}
 })
 
 var _ = AfterSuite(func() {
-	Expect(env.Stop()).NotTo(HaveOccurred())
+	if env == nil {
+		Expect(env.Stop()).NotTo(HaveOccurred())
+	}
 })

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# +skip_license_check
+
 # Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,41 +20,39 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-TRUST_DISTRIBUTION_PKG="github.com/cert-manager/trust-manager"
-BOILERPLATE="hack/boilerplate/boilerplate.go.txt"
+if [[ -z "${1:-}" || -z "${2:-}" ]]; then
+	echo "usage: $0 <path-to-controller-gen> <path-to-yq>" >&2
+	exit 1
+fi
 
-APIS_PKG="$TRUST_DISTRIBUTION_PKG/pkg/apis"
-GROUPS_WITH_VERSIONS="trust:v1alpha1"
-
-SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
-BIN_DIR=${SCRIPT_ROOT}/bin
-
-function codegen::join() { local IFS="$1"; shift; echo "$*"; }
-
-# enumerate group versions
-FQ_APIS=() # e.g. k8s.io/api/apps/v1
-for GVs in ${GROUPS_WITH_VERSIONS}; do
-  IFS=: read -r G Vs <<<"${GVs}"
-
-  # enumerate versions
-  for V in ${Vs//,/ }; do
-    FQ_APIS+=("${APIS_PKG}/${G}/${V}")
-  done
-done
-
-echo "Generating deepcopy funcs"
-${BIN_DIR}/deepcopy-gen --input-dirs "$(codegen::join , "${FQ_APIS[@]}")" -O zz_generated.deepcopy --bounding-dirs "${APIS_PKG}" -h $BOILERPLATE
+CONTROLLER_GEN=$(realpath "$1")
+YQ=$(realpath "$2")
 
 echo "Generating CRDs in ./deploy/crds"
-${BIN_DIR}/controller-gen crd schemapatch:manifests=./deploy/crds output:dir=./deploy/crds paths=./pkg/apis/...
+$CONTROLLER_GEN crd schemapatch:manifests=./deploy/crds output:dir=./deploy/crds paths=./pkg/apis/...
 
 echo "Updating CRDs with helm templating, writing to ./deploy/charts/trust-manager/templates"
 for i in $(ls ./deploy/crds); do
 
-  cat << EOF > ./deploy/charts/trust-manager/templates/$i
-{{ if .Values.crds.enabled }}
-$(cat ./deploy/crds/$i)
-{{ end }}
+	crd_name=$($YQ eval '.metadata.name' "./deploy/crds/$i")
+
+	cat << EOF > ./deploy/charts/trust-manager/templates/$i
+{{- if .Values.crds.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: "$crd_name"
+  {{- if .Values.crds.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+  labels:
+    {{- include "trust-manager.labels" . | nindent 4 }}
 EOF
 
+	$YQ -I2 '{"spec": .spec}' "./deploy/crds/$i" >> ./deploy/charts/trust-manager/templates/$i
+
+	cat << EOF >> ./deploy/charts/trust-manager/templates/$i
+{{- end }}
+EOF
 done

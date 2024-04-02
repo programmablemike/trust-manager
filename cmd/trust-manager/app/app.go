@@ -22,12 +22,19 @@ import (
 	"net/http"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/kubernetes"
 	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"github.com/cert-manager/trust-manager/cmd/app/options"
+	"github.com/cert-manager/trust-manager/cmd/trust-manager/app/options"
 	trustapi "github.com/cert-manager/trust-manager/pkg/apis/trust/v1alpha1"
 	"github.com/cert-manager/trust-manager/pkg/bundle"
 	"github.com/cert-manager/trust-manager/pkg/webhook"
@@ -60,6 +67,9 @@ func NewCommand() *cobra.Command {
 			}
 
 			mlog := opts.Logr.WithName("manager")
+
+			ctrl.SetLogger(mlog)
+
 			eventBroadcaster := record.NewBroadcaster()
 			eventBroadcaster.StartLogging(func(format string, args ...any) { mlog.V(3).Info(fmt.Sprintf(format, args...)) })
 			eventBroadcaster.StartRecordingToSink(&clientv1.EventSinkImpl{Interface: cl.CoreV1().Events("")})
@@ -68,19 +78,65 @@ func NewCommand() *cobra.Command {
 				Scheme:                        trustapi.GlobalScheme,
 				EventBroadcaster:              eventBroadcaster,
 				LeaderElection:                true,
-				LeaderElectionNamespace:       opts.Bundle.Namespace,
 				LeaderElectionID:              "trust-manager-leader-election",
 				LeaderElectionReleaseOnCancel: true,
 				ReadinessEndpointName:         opts.ReadyzPath,
 				HealthProbeBindAddress:        fmt.Sprintf("0.0.0.0:%d", opts.ReadyzPort),
-				Port:                          opts.Webhook.Port,
-				Host:                          opts.Webhook.Host,
-				CertDir:                       opts.Webhook.CertDir,
-				MetricsBindAddress:            fmt.Sprintf("0.0.0.0:%d", opts.MetricsPort),
-				Logger:                        mlog,
+				WebhookServer: ctrlwebhook.NewServer(ctrlwebhook.Options{
+					Port:    opts.Webhook.Port,
+					Host:    opts.Webhook.Host,
+					CertDir: opts.Webhook.CertDir,
+				}),
+				Metrics: server.Options{
+					BindAddress: fmt.Sprintf("0.0.0.0:%d", opts.MetricsPort),
+				},
+				Logger: mlog,
+				Cache: cache.Options{
+					ReaderFailOnMissingInformer: true,
+					ByObject: map[client.Object]cache.ByObject{
+						&trustapi.Bundle{}:  {},
+						&corev1.Namespace{}: {},
+						&corev1.ConfigMap{}: {
+							// Only cache full ConfigMaps in the "watched" namespace.
+							// Target ConfigMaps have a dedicated cache
+							Namespaces: map[string]cache.Config{
+								opts.Bundle.Namespace: {},
+							},
+						},
+						&corev1.Secret{}: {
+							// Only cache full Secrets in the "watched" namespace.
+							// Target Secrets have a dedicated cache
+							Namespaces: map[string]cache.Config{
+								opts.Bundle.Namespace: {},
+							},
+						},
+					},
+				},
 			})
 			if err != nil {
 				return fmt.Errorf("failed to create manager: %w", err)
+			}
+
+			targetCache, err := cache.New(mgr.GetConfig(), cache.Options{
+				HTTPClient:                  mgr.GetHTTPClient(),
+				Scheme:                      mgr.GetScheme(),
+				Mapper:                      mgr.GetRESTMapper(),
+				ReaderFailOnMissingInformer: true,
+				DefaultLabelSelector: func() labels.Selector {
+					targetRequirement, err := labels.NewRequirement(trustapi.BundleLabelKey, selection.Exists, nil)
+					if err != nil {
+						panic(fmt.Errorf("failed to create target label requirement: %w", err))
+					}
+
+					return labels.NewSelector().Add(*targetRequirement)
+				}(),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create target cache: %w", err)
+			}
+
+			if err := mgr.Add(targetCache); err != nil {
+				return fmt.Errorf("failed to add target cache to manager: %w", err)
 			}
 
 			// Add readiness check that the manager's informers have been synced.
@@ -94,7 +150,7 @@ func NewCommand() *cobra.Command {
 			ctx := ctrl.SetupSignalHandler()
 
 			// Add Bundle controller to manager.
-			if err := bundle.AddBundleController(ctx, mgr, opts.Bundle); err != nil {
+			if err := bundle.AddBundleController(ctx, mgr, opts.Bundle, targetCache); err != nil {
 				return fmt.Errorf("failed to register Bundle controller: %w", err)
 			}
 

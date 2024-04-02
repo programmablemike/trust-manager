@@ -19,7 +19,9 @@ package test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -31,9 +33,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2/ktesting"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest/komega"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -81,6 +84,7 @@ var _ = Describe("Integration", func() {
 			Scheme: trustapi.GlobalScheme,
 		})
 		Expect(err).NotTo(HaveOccurred())
+		komega.SetClient(cl)
 
 		namespace := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
@@ -110,7 +114,7 @@ var _ = Describe("Integration", func() {
 
 		mgrStopped = make(chan struct{})
 
-		Expect(bundle.AddBundleController(ctx, mgr, opts)).NotTo(HaveOccurred())
+		Expect(bundle.AddBundleController(ctx, mgr, opts, mgr.GetCache())).NotTo(HaveOccurred())
 
 		By("Running Bundle controller")
 		go func() {
@@ -128,11 +132,9 @@ var _ = Describe("Integration", func() {
 
 		By("Creating Bundle for test")
 		testData = testenv.DefaultTrustData()
-		testBundle = testenv.NewTestBundle(ctx, cl, opts, testData)
+		testBundle = testenv.NewTestBundleConfigMapTarget(ctx, cl, opts, testData)
 
 		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, dummy.DefaultJoinedCerts())
-
-		Expect(cl.Get(ctx, client.ObjectKeyFromObject(testBundle), testBundle)).ToNot(HaveOccurred())
 	})
 
 	AfterEach(func() {
@@ -164,11 +166,11 @@ var _ = Describe("Integration", func() {
 			},
 		})).NotTo(HaveOccurred())
 
-		Expect(cl.Get(ctx, client.ObjectKeyFromObject(testBundle), testBundle)).ToNot(HaveOccurred())
-		testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{
-			ConfigMap: &trustapi.SourceObjectKeySelector{Name: "new-bundle-source", KeySelector: trustapi.KeySelector{Key: "new-source-key"}},
-		})
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{
+				ConfigMap: &trustapi.SourceObjectKeySelector{Name: "new-bundle-source", KeySelector: trustapi.KeySelector{Key: "new-source-key"}},
+			})
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate2, dummy.TestCertificate3, dummy.TestCertificate4)
 
@@ -186,12 +188,11 @@ var _ = Describe("Integration", func() {
 			},
 		})).NotTo(HaveOccurred())
 
-		Expect(cl.Get(ctx, client.ObjectKeyFromObject(testBundle), testBundle)).ToNot(HaveOccurred())
-
-		testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{
-			Secret: &trustapi.SourceObjectKeySelector{Name: "new-bundle-source", KeySelector: trustapi.KeySelector{Key: "new-source-key"}},
-		})
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{
+				Secret: &trustapi.SourceObjectKeySelector{Name: "new-bundle-source", KeySelector: trustapi.KeySelector{Key: "new-source-key"}},
+			})
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate2, dummy.TestCertificate3, dummy.TestCertificate4)
 
@@ -201,8 +202,9 @@ var _ = Describe("Integration", func() {
 	It("should update all targets when an inLine source is added", func() {
 		newInLine := dummy.TestCertificate4
 
-		testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{InLine: &newInLine})
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{InLine: &newInLine})
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate2, dummy.TestCertificate3, dummy.TestCertificate4)
 
@@ -210,16 +212,18 @@ var _ = Describe("Integration", func() {
 	})
 
 	It("should update all targets when a default CA source is added", func() {
-		testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{UseDefaultCAs: pointer.Bool(true)})
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = append(testBundle.Spec.Sources, trustapi.BundleSource{UseDefaultCAs: ptr.To(true)})
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate2, dummy.TestCertificate3, dummy.TestCertificate5)
 		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, expectedData)
 	})
 
 	It("should update all targets when a ConfigMap source is removed", func() {
-		testBundle.Spec.Sources = []trustapi.BundleSource{testBundle.Spec.Sources[1], testBundle.Spec.Sources[2]}
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = []trustapi.BundleSource{testBundle.Spec.Sources[1], testBundle.Spec.Sources[2]}
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate2, dummy.TestCertificate3)
 
@@ -227,12 +231,12 @@ var _ = Describe("Integration", func() {
 	})
 
 	It("should update all targets when a Secret source is removed", func() {
-		testBundle.Spec.Sources = []trustapi.BundleSource{
-			testBundle.Spec.Sources[0],
-			testBundle.Spec.Sources[2],
-		}
-
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = []trustapi.BundleSource{
+				testBundle.Spec.Sources[0],
+				testBundle.Spec.Sources[2],
+			}
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate3)
 
@@ -240,11 +244,12 @@ var _ = Describe("Integration", func() {
 	})
 
 	It("should update all targets when an InLine source is removed", func() {
-		testBundle.Spec.Sources = []trustapi.BundleSource{
-			testBundle.Spec.Sources[0],
-			testBundle.Spec.Sources[1],
-		}
-		Expect(cl.Update(ctx, testBundle)).NotTo(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources = []trustapi.BundleSource{
+				testBundle.Spec.Sources[0],
+				testBundle.Spec.Sources[1],
+			}
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate2)
 
@@ -282,9 +287,9 @@ var _ = Describe("Integration", func() {
 	It("should update all targets when an InLine source has been modified", func() {
 		newInLine := dummy.TestCertificate4
 
-		testBundle.Spec.Sources[2].InLine = &newInLine
-
-		Expect(cl.Update(ctx, testBundle)).ToNot(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Sources[2].InLine = &newInLine
+		})()).To(Succeed())
 
 		expectedData := dummy.JoinCerts(dummy.TestCertificate1, dummy.TestCertificate2, dummy.TestCertificate4)
 
@@ -292,11 +297,11 @@ var _ = Describe("Integration", func() {
 	})
 
 	It("should delete old targets and update to new ones when the Spec.Target is modified", func() {
-		testBundle.Spec.Target = trustapi.BundleTarget{
-			ConfigMap: &trustapi.KeySelector{Key: "changed-target-key"},
-		}
-
-		Expect(cl.Update(ctx, testBundle)).ToNot(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Target = trustapi.BundleTarget{
+				ConfigMap: &trustapi.KeySelector{Key: "changed-target-key"},
+			}
+		})()).To(Succeed())
 
 		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, dummy.DefaultJoinedCerts())
 
@@ -317,6 +322,40 @@ var _ = Describe("Integration", func() {
 		}
 	})
 
+	It("should delete old targets and update to new ones when a JKS file is requested in the target", func() {
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Target = trustapi.BundleTarget{
+				ConfigMap: &trustapi.KeySelector{Key: testData.Target.Key},
+				AdditionalFormats: &trustapi.AdditionalFormats{
+					JKS: &trustapi.JKS{
+						KeySelector: trustapi.KeySelector{
+							Key: "myfile.jks",
+						},
+					},
+				},
+			}
+		})()).To(Succeed())
+
+		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, dummy.DefaultJoinedCerts())
+
+		var namespaceList corev1.NamespaceList
+		Expect(cl.List(ctx, &namespaceList)).ToNot(HaveOccurred())
+
+		for _, namespace := range namespaceList.Items {
+			if namespace.Status.Phase == corev1.NamespaceTerminating {
+				continue
+			}
+
+			var configMap corev1.ConfigMap
+			Expect(cl.Get(ctx, client.ObjectKey{Namespace: namespace.Name, Name: testBundle.Name}, &configMap)).ToNot(HaveOccurred())
+
+			jksData, exists := configMap.BinaryData["myfile.jks"]
+			Expect(exists).To(BeTrue(), "should find an entry called myfile.jks")
+
+			Expect(testenv.CheckJKSFileSynced(jksData, bundle.DefaultJKSPassword, dummy.DefaultJoinedCerts())).ToNot(HaveOccurred())
+		}
+	})
+
 	It("should re-add the owner reference of a target ConfigMap if it has been removed", func() {
 		var configMap corev1.ConfigMap
 		Expect(cl.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: testBundle.Name}, &configMap)).ToNot(HaveOccurred())
@@ -333,8 +372,8 @@ var _ = Describe("Integration", func() {
 				APIVersion:         "trust.cert-manager.io/v1alpha1",
 				UID:                testBundle.UID,
 				Name:               testBundle.Name,
-				Controller:         pointer.Bool(true),
-				BlockOwnerDeletion: pointer.Bool(true),
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
 			})
 		}, eventuallyTimeout, eventuallyPollInterval).Should(BeTrue(), "ensuring owner references were re-added correctly")
 	})
@@ -383,10 +422,11 @@ var _ = Describe("Integration", func() {
 		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, expectedData)
 
 		// add a label selector to the Bundle which should exclude all namespaces
-		testBundle.Spec.Target.NamespaceSelector = &trustapi.NamespaceSelector{
-			MatchLabels: map[string]string{"foo": "bar"},
-		}
-		Expect(cl.Update(ctx, testBundle)).ToNot(HaveOccurred())
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Target.NamespaceSelector = &trustapi.NamespaceSelector{
+				MatchLabels: map[string]string{"foo": "bar"},
+			}
+		})()).To(Succeed())
 
 		// confirm that the new namespace doesn't contain the config map any more
 		// (no namespace should contain it but for brevity, only check the new one)
@@ -405,6 +445,128 @@ var _ = Describe("Integration", func() {
 		Eventually(func() error {
 			return testenv.CheckBundleSynced(ctx, cl, testBundle.Name, testNamespace.Name, expectedData)
 		}, eventuallyTimeout, eventuallyPollInterval).Should(BeNil(), "checking that bundle was re-added to newly labelled namespace")
+	})
+
+	Context("Reconcile consistency", func() {
+		It("should have stable resourceVersion", func() {
+			var configMap corev1.ConfigMap
+			Expect(cl.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: testBundle.Name}, &configMap)).To(Succeed())
+			resourceVersion := configMap.ResourceVersion
+			Consistently(komega.Object(&configMap)).Should(HaveField("ObjectMeta.ResourceVersion", Equal(resourceVersion)))
+		})
+
+		It("should have stable resourceVersion for JKS target", func() {
+			Expect(komega.Update(testBundle, func() {
+				testBundle.Spec.Target.AdditionalFormats = &trustapi.AdditionalFormats{
+					JKS: &trustapi.JKS{KeySelector: trustapi.KeySelector{Key: "target.jks"}}}
+			})()).To(Succeed())
+
+			configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: testBundle.Name}}
+			Eventually(komega.Object(configMap)).Should(HaveField("BinaryData", HaveKey("target.jks")))
+
+			resourceVersion := configMap.ResourceVersion
+			Consistently(komega.Object(configMap)).Should(HaveField("ObjectMeta.ResourceVersion", Equal(resourceVersion)))
+		})
+
+		It("should have stable resourceVersion for PKCS12 target", func() {
+			Expect(komega.Update(testBundle, func() {
+				testBundle.Spec.Target.AdditionalFormats = &trustapi.AdditionalFormats{
+					PKCS12: &trustapi.PKCS12{KeySelector: trustapi.KeySelector{Key: "target.p12"}}}
+			})()).To(Succeed())
+
+			configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: testBundle.Name}}
+			Eventually(komega.Object(configMap)).Should(HaveField("BinaryData", HaveKey("target.p12")))
+
+			resourceVersion := configMap.ResourceVersion
+			Consistently(komega.Object(configMap)).Should(HaveField("ObjectMeta.ResourceVersion", Equal(resourceVersion)))
+		})
+	})
+
+	It("should migrate bundle from CSA to SSA", func() {
+		Expect(komega.UpdateStatus(testBundle, func() {
+			testBundle.Status = trustapi.BundleStatus{
+				DefaultCAPackageVersion: ptr.To("OLD_VERSION"),
+				Conditions: []trustapi.BundleCondition{
+					{
+						Type:               "OLD_CONDITION",
+						Status:             metav1.ConditionTrue,
+						Reason:             "OldReason",
+						LastTransitionTime: metav1.Time{Time: time.Unix(0, 0)},
+					},
+				},
+			}
+
+		}, &client.SubResourceUpdateOptions{
+			UpdateOptions: client.UpdateOptions{
+				FieldManager: "Go-http-client",
+			},
+		})()).To(Succeed())
+
+		Eventually(func() error {
+			err := cl.Get(ctx, client.ObjectKeyFromObject(testBundle), testBundle)
+
+			if err != nil {
+				return err
+			}
+
+			if testBundle.Status.DefaultCAPackageVersion != nil && *testBundle.Status.DefaultCAPackageVersion == "OLD_VERSION" {
+				return fmt.Errorf("old package version still present")
+			}
+
+			for _, condition := range testBundle.Status.Conditions {
+				if condition.Type == "OLD_CONDITION" {
+					return fmt.Errorf("old condition still present")
+				}
+			}
+
+			return nil
+		}, eventuallyTimeout, eventuallyPollInterval).Should(BeNil(), "checking that bundle was re-added to newly labelled namespace")
+	})
+
+	It("should migrate configmap from CSA to SSA", func() {
+		oldKey := testBundle.Spec.Target.ConfigMap.Key
+		newKey := "NEW_KEY"
+
+		// Create a new namespace for this test; GenerateName will populate the name after creation
+		// We use GenerateName to create a new uniquely-named namespace that shouldn't clash with any of
+		// the existing ones.
+		testNamespace := corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "trust-bundle-integration-ns-",
+			},
+		}
+		Expect(cl.Create(ctx, &testNamespace)).NotTo(HaveOccurred())
+
+		expectedData := dummy.DefaultJoinedCerts()
+
+		// confirm all namespaces - including the new one - have the expected data
+		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, expectedData)
+
+		var cm corev1.ConfigMap
+		Expect(cl.Get(ctx, client.ObjectKey{Namespace: testNamespace.Name, Name: testBundle.Name}, &cm)).NotTo(HaveOccurred())
+
+		// Simulate a CSA configmap by setting the managed fields to the "CSA" values
+		for i, mf := range cm.ManagedFields {
+			if mf.Manager != "trust-manager" || mf.Operation != "Apply" || mf.Subresource != "" {
+				continue
+			}
+
+			cm.ManagedFields[i].Manager = "Go-http-client"
+			cm.ManagedFields[i].Operation = "Update"
+		}
+
+		Expect(cl.Update(ctx, &cm)).NotTo(HaveOccurred())
+
+		Expect(komega.Update(testBundle, func() {
+			testBundle.Spec.Target.ConfigMap.Key = newKey
+		})()).To(Succeed())
+
+		// confirm all namespaces - including the new one - have the expected data
+		testenv.EventuallyBundleHasSyncedAllNamespaces(ctx, cl, testBundle.Name, expectedData)
+
+		Expect(cl.Get(ctx, client.ObjectKey{Namespace: testNamespace.Name, Name: testBundle.Name}, &cm)).NotTo(HaveOccurred())
+
+		Expect(cm.Data).To(Not(HaveKey(oldKey)))
 	})
 })
 
